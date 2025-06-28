@@ -20,6 +20,7 @@ from bfcl_eval.constants.model_config import MODEL_CONFIG_MAPPING
 from bfcl_eval.model_handler.model_style import ModelStyle
 from bfcl_eval.utils import is_multi_turn, parse_test_category_argument, sort_key
 from tqdm import tqdm
+import traceback
 
 RETRY_LIMIT = 3
 # 60s for the timer to complete. But often we find that even with 60 there is a conflict. So 65 is a safe no.
@@ -206,6 +207,7 @@ def multi_threaded_inference(handler, test_case, include_input_log, exclude_stat
                 return {
                     "id": test_case["id"],
                     "result": f"Error during inference: {str(e)}",
+                    "traceback": traceback.format_exc()
                 }
 
     result_to_write = {

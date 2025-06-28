@@ -18,6 +18,7 @@ from bfcl_eval.model_handler.utils import (
 from openai import OpenAI
 from overrides import EnforceOverrides, final, override
 from tqdm import tqdm
+import traceback
 
 
 class OSSHandler(BaseHandler, EnforceOverrides):
@@ -287,7 +288,9 @@ class OSSHandler(BaseHandler, EnforceOverrides):
             print("-" * 100)
 
             model_responses = f"Error during inference: {str(e)}"
-            metadata = {}
+            metadata = {
+                "traceback": traceback.format_exc()
+            }
 
         result_to_write = {
             "id": test_case["id"],
