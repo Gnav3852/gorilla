@@ -172,9 +172,106 @@ class GPTOSSHandler(OSSHandler):
 
     def _parse_harmony_response(self, api_response):
         """Parse response using Harmony format."""
-        # This would need to be implemented based on the actual Harmony response format
-        # For now, fall back to standard parsing
-        return self._parse_fallback_response(api_response)
+        if not self.harmony_encoding:
+            return self._parse_fallback_response(api_response)
+
+        try:
+            token_ids = None
+
+            # Try different locations for token ids depending on the response schema
+            if hasattr(api_response, "output") and api_response.output:
+                first = api_response.output[0]
+                token_ids = getattr(first, "token_ids", None) or getattr(first, "tokens", None)
+
+            if token_ids is None and hasattr(api_response, "choices") and api_response.choices:
+                choice = api_response.choices[0]
+                token_ids = getattr(choice, "token_ids", None)
+                if token_ids is None and getattr(choice, "logprobs", None) is not None:
+                    token_ids = getattr(choice.logprobs, "token_ids", None) or getattr(choice.logprobs, "tokens", None)
+
+            if not token_ids:
+                return self._parse_fallback_response(api_response)
+
+            parsed_messages = self.harmony_encoding.parse_messages_from_completion_tokens(
+                token_ids, Role.ASSISTANT
+            )
+
+            assistant_messages: List[Dict[str, Any]] = []
+            tool_call_ids: List[str] = []
+            tool_names: List[str] = []
+            tool_calls: List[Dict[str, Any]] = []
+            final_messages: List[str] = []
+            reasoning_messages: List[str] = []
+
+            for msg in parsed_messages:
+                if msg.role != Role.ASSISTANT:
+                    continue
+
+                recipient = getattr(msg, "recipient", None)
+                channel = getattr(msg, "channel", None)
+
+                if recipient:
+                    try:
+                        args = json.loads(msg.content)
+                    except Exception:
+                        args = msg.content
+
+                    tool_calls.append({recipient: args})
+                    tool_names.append(recipient)
+                    tool_call_ids.append(recipient)
+
+                    assistant_messages.append(
+                        {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": recipient,
+                                    "type": "function",
+                                    "function": {
+                                        "name": recipient,
+                                        "arguments": json.dumps(args)
+                                        if isinstance(args, (dict, list))
+                                        else str(args),
+                                    },
+                                }
+                            ],
+                            "content": "",
+                        }
+                    )
+                else:
+                    if channel == "analysis":
+                        reasoning_messages.append(msg.content)
+                    else:
+                        final_messages.append(msg.content)
+
+                    assistant_messages.append(
+                        {"role": "assistant", "content": msg.content}
+                    )
+
+            model_responses: Any
+            if tool_calls:
+                model_responses = tool_calls
+            else:
+                # Use the last non-analysis message as final response
+                model_responses = final_messages[-1] if final_messages else ""
+
+            return {
+                "model_responses": model_responses,
+                "model_responses_message_for_chat_history": assistant_messages,
+                "model_responses_decoded": tool_names,
+                "tool_call_ids": tool_call_ids,
+                "reasoning_content": "\n".join(reasoning_messages),
+                "input_token": getattr(api_response.usage, "prompt_tokens", 0)
+                if hasattr(api_response, "usage")
+                else 0,
+                "output_token": getattr(api_response.usage, "completion_tokens", 0)
+                if hasattr(api_response, "usage")
+                else 0,
+            }
+
+        except Exception as e:
+            print(f"Warning: Harmony response parsing failed: {e}")
+            return self._parse_fallback_response(api_response)
 
     def _parse_fallback_response(self, api_response):
         """Fallback response parsing."""
@@ -192,10 +289,35 @@ class GPTOSSHandler(OSSHandler):
     @override
     def _add_assistant_message_prompting(self, inference_data: dict, model_response_data: dict) -> dict:
         """Add assistant message to conversation."""
-        inference_data["message"].append({
-            "role": "assistant",
-            "content": model_response_data["model_responses"]
-        })
+        messages = model_response_data.get(
+            "model_responses_message_for_chat_history"
+        )
+        if messages:
+            inference_data["message"].extend(messages)
+        else:
+            inference_data["message"].append(
+                {
+                    "role": "assistant",
+                    "content": model_response_data["model_responses"],
+                }
+            )
+        return inference_data
+
+    def _add_assistant_message_FC(
+        self, inference_data: dict, model_response_data: dict
+    ) -> dict:
+        messages = model_response_data.get(
+            "model_responses_message_for_chat_history"
+        )
+        if messages:
+            inference_data["message"].extend(messages)
+        else:
+            inference_data["message"].append(
+                {
+                    "role": "assistant",
+                    "content": model_response_data["model_responses"],
+                }
+            )
         return inference_data
 
     def _get_model_path(self):
