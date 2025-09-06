@@ -91,8 +91,8 @@ class GPTOSSHandler(OSSHandler):
         system_content = SystemContent.new()
 
         # Add tools if available
-        for ns in harmony_tools.values():
-            system_content = system_content.with_tools(ns)
+        if harmony_tools:
+            system_content = system_content.with_tools(harmony_tools)
 
         # Add conversation start date
         system_content = system_content.with_conversation_start_date(
@@ -380,8 +380,8 @@ class GPTOSSHandler(OSSHandler):
         system_content = SystemContent.new().with_conversation_start_date(
             datetime.now().strftime("%Y-%m-%d")
         )
-        for ns in tools.values():
-            system_content = system_content.with_tools(ns)
+        if tools:
+            system_content = system_content.with_tools(tools)
 
         harmony_messages: List[Message] = [
             Message.from_role_and_content(Role.SYSTEM, system_content)
