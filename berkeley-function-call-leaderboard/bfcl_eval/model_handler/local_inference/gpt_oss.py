@@ -354,7 +354,9 @@ class GPTOSSHandler(OSSHandler):
         harmony_messages = [
             Message.from_role_and_content(Role.SYSTEM, system_content)
         ]
-        harmony_messages.extend(Message.from_dict(m) for m in messages)
+        harmony_messages.extend(
+            Message.from_dict(m) for m in messages if m.get("role") != "system"
+        )
         return Conversation.from_messages(harmony_messages)
 
     @override
