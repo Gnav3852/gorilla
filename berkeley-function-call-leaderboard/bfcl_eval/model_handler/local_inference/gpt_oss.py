@@ -109,33 +109,37 @@ class GPTOSSHandler(OSSHandler):
         
         # Create conversation
         conversation = Conversation()
-        
+
         # Add system message
-        conversation.add_message(Message.from_role_and_content(Role.SYSTEM, system_content))
-        
+        system_message = Message.from_role_and_content(Role.SYSTEM, system_content)
+        conversation.messages.append(system_message)
+
         # Add remaining messages
         for msg in messages:
             if msg["role"] == "system":
                 continue  # Skip system messages as we already added one
-            
+
             role = Role.USER if msg["role"] == "user" else Role.ASSISTANT
             content = msg["content"]
-            
+
             # Handle tool calls in assistant messages
             if msg["role"] == "assistant" and "tool_calls" in msg:
                 # Add assistant message with tool calls
-                conversation.add_message(Message(role=Role.ASSISTANT, content=content))
-                
+                assistant_msg = Message.from_role_and_content(Role.ASSISTANT, content)
+                conversation.messages.append(assistant_msg)
+
                 # Add tool responses
                 for tool_call in msg["tool_calls"]:
                     tool_name = tool_call.get("function", {}).get("name", "")
                     tool_args = tool_call.get("function", {}).get("arguments", "{}")
-                    conversation.add_message(Message(
-                        role=Role.TOOL, 
-                        content=f"Tool: {tool_name}, Args: {tool_args}"
-                    ))
+                    tool_msg = Message.from_role_and_content(
+                        Role.TOOL,
+                        f"Tool: {tool_name}, Args: {tool_args}"
+                    )
+                    conversation.messages.append(tool_msg)
             else:
-                conversation.add_message(Message(role=role, content=content))
+                message = Message.from_role_and_content(role, content)
+                conversation.messages.append(message)
         
         # Encode using Harmony
         token_ids = self.harmony_encoding.render_conversation_for_completion(
@@ -432,37 +436,39 @@ class GPTOSSHandler(OSSHandler):
         for ns in tools.values():
             system_content = system_content.with_tools(ns)
         conversation = Conversation()
-        conversation.add_message(
-            Message.from_role_and_content(Role.SYSTEM, system_content)
-        )
+        system_message = Message.from_role_and_content(Role.SYSTEM, system_content)
+        conversation.messages.append(system_message)
 
         for msg in messages:
             role = msg.get("role")
             if role == "user":
-                conversation.add_message(
-                    Message.from_role_and_content(Role.USER, msg.get("content", ""))
+                user_msg = Message.from_role_and_content(
+                    Role.USER, msg.get("content", "")
                 )
+                conversation.messages.append(user_msg)
             elif role == "assistant":
                 content = msg.get("content", "")
-                conversation.add_message(
-                    Message.from_role_and_content(Role.ASSISTANT, content).with_channel("final")
-                )
+                assistant_msg = Message.from_role_and_content(Role.ASSISTANT, content)
+                assistant_msg = assistant_msg.with_channel("final")
+                conversation.messages.append(assistant_msg)
                 for tool_call in msg.get("tool_calls", []):
                     fn = tool_call.get("function", {})
-                    conversation.add_message(
-                        Message.from_role_and_content(
-                            Role.ASSISTANT, fn.get("arguments", "")
-                        )
-                        .with_recipient(f"functions.{fn.get('name', '')}")
-                        .with_channel("commentary")
+                    tool_msg = Message.from_role_and_content(
+                        Role.ASSISTANT, fn.get("arguments", "")
                     )
+                    tool_msg = tool_msg.with_recipient(
+                        f"functions.{fn.get('name', '')}"
+                    )
+                    tool_msg = tool_msg.with_channel("commentary")
+                    conversation.messages.append(tool_msg)
             elif role == "tool":
-                conversation.add_message(
-                    Message.from_author_and_content(
-                        Author.new(Role.TOOL, f"functions.{msg.get('name', '')}"),
-                        msg.get("content", ""),
-                    ).with_recipient("assistant").with_channel("commentary")
+                tool_message = Message.from_author_and_content(
+                    Author.new(Role.TOOL, f"functions.{msg.get('name', '')}"),
+                    msg.get("content", ""),
                 )
+                tool_message = tool_message.with_recipient("assistant")
+                tool_message = tool_message.with_channel("commentary")
+                conversation.messages.append(tool_message)
         return conversation
 
     @override
