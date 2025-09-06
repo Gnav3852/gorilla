@@ -350,20 +350,6 @@ class GPTOSSHandler(OSSHandler):
     ) -> dict:
         return self._add_assistant_message(inference_data, model_response_data)
 
-    def _get_model_path(self):
-        """Get the model path for GPT-OSS models."""
-        if "20b" in self.model_name:
-            return os.getenv("GPT_OSS_20B_PATH", "./models/gpt-oss-20b")
-        elif "120b" in self.model_name:
-            return os.getenv("GPT_OSS_120B_PATH", "./models/gpt-oss-120b")
-        else:
-            return os.getenv("GPT_OSS_MODEL_PATH", "./models/gpt-oss")
-
-    def _get_vllm_endpoint(self):
-        """Get the vLLM endpoint for remote inference."""
-        endpoint = os.getenv("VLLM_ENDPOINT", "localhost")
-        port = os.getenv("VLLM_PORT", "8000")
-        return f"http://{endpoint}:{port}"
 
     #### FC methods ####
 
