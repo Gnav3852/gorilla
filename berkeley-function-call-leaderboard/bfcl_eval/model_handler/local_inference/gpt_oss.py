@@ -483,7 +483,8 @@ class GPTOSSHandler(OSSHandler):
         token_ids = self.harmony_encoding.render_conversation_for_completion(
             conversation, Role.ASSISTANT
         )
-        inference_data["inference_input_log"] = {"token_ids": token_ids}
+        prompt = self.harmony_encoding.decode_utf8(token_ids)
+        inference_data["inference_input_log"] = {"prompt": prompt}
 
         input_token_count = len(token_ids)
         if self.max_context_length < input_token_count + 2:
@@ -493,16 +494,11 @@ class GPTOSSHandler(OSSHandler):
                 4096, self.max_context_length - input_token_count - 2
             )
 
-        decoder_config = {
-            "temperature": self.temperature,
-            "max_new_tokens": leftover_tokens_count,
-            "stop_token_ids": self.harmony_encoding.stop_tokens_for_assistant_actions(),
-        }
-
         payload = {
             "model": self.model_path_or_id,
-            "input": token_ids,
-            "decoder_config": decoder_config,
+            "input": prompt,
+            "temperature": self.temperature,
+            "max_output_tokens": leftover_tokens_count,
         }
 
         start_time = time.time()
