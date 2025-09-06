@@ -431,7 +431,8 @@ class GPTOSSHandler(OSSHandler):
         conversation = self._build_conversation(message, tools)
 
         conversation_tokens = self.harmony_encoding.render_conversation_for_completion(
-            conversation
+            conversation=conversation,
+            next_turn_role=Role.ASSISTANT,
         )
         inference_data["inference_input_log"] = {"prompt": conversation_tokens}
 
