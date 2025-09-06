@@ -46,8 +46,7 @@ dependencies = [
     "google-search-results",
     "sentence-transformers>=2.7.0",
     "faiss-cpu==1.11.0",
-    "networkx==3.3",
-    "openai-harmony>=0.1.0"
+    "networkx==3.3"
 ]
 
 [project.scripts]
