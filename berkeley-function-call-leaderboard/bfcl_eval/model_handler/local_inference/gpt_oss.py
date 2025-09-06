@@ -109,8 +109,15 @@ class GPTOSSHandler(OSSHandler):
                 conversation.add_message(Message(role=role, content=content))
         
         # Encode using Harmony
-        token_ids = self.harmony_encoding.render_conversation_for_completion(conversation, Role.ASSISTANT)
-        return self.tokenizer.decode(token_ids)
+        token_ids = self.harmony_encoding.render_conversation_for_completion(
+            conversation, Role.ASSISTANT
+        )
+
+        # Return the raw token ids so that `_query_prompting` can send them
+        # directly in the request body (under the `input` field) without
+        # decoding. This preserves Harmony markers and avoids a round-trip
+        # through text.
+        return token_ids
 
     def _format_prompt_fallback(self, messages, function):
         """Fallback formatting when Harmony is not available."""

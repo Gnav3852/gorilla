@@ -37,6 +37,12 @@ class OSSHandler(BaseHandler, EnforceOverrides):
         self.base_url = f"http://{self.local_server_endpoint}:{self.local_server_port}/v1"
         self.client = OpenAI(base_url=self.base_url, api_key="EMPTY")
 
+        # By default assume the local server can accept token ID lists directly.
+        # Set to True if the backing OpenAI-compatible server expects a text
+        # prompt. `_query_prompting` will decode token lists accordingly when
+        # this flag is enabled.
+        self.server_requires_text_prompt = False
+
     @override
     def inference(
         self,
@@ -275,11 +281,15 @@ class OSSHandler(BaseHandler, EnforceOverrides):
         function: list[dict] = inference_data["function"]
         message: list[dict] = inference_data["message"]
 
-        formatted_prompt: str = self._format_prompt(message, function)
+        formatted_prompt = self._format_prompt(message, function)
         inference_data["inference_input_log"] = {"formatted_prompt": formatted_prompt}
 
-        # Tokenize the formatted prompt to get token count
-        input_token_count = len(self.tokenizer.tokenize(formatted_prompt))
+        # Determine token count depending on whether Harmony encoding returned
+        # raw token IDs or a string prompt.
+        if isinstance(formatted_prompt, list):
+            input_token_count = len(formatted_prompt)
+        else:
+            input_token_count = len(self.tokenizer.tokenize(formatted_prompt))
 
         # Determine the number of tokens to request. Cap it at 4096 if the model has a larger limit.
         if self.max_context_length < input_token_count + 2:
@@ -297,24 +307,36 @@ class OSSHandler(BaseHandler, EnforceOverrides):
         if hasattr(self, "skip_special_tokens"):
             extra_body["skip_special_tokens"] = self.skip_special_tokens
 
-        start_time = time.time()
-        if len(extra_body) > 0:
-            api_response = self.client.completions.create(
-                model=self.model_path_or_id,
-                temperature=self.temperature,
-                prompt=formatted_prompt,
-                max_tokens=leftover_tokens_count,
-                extra_body=extra_body,
-                timeout=72000,  # Avoid timeout errors
-            )
+        # Build the request payload. When Harmony encoding is used the prompt
+        # is already a list of token IDs and should be sent under the `input`
+        # field to the OpenAI-compatible server. Some servers only accept text
+        # prompts; set `server_requires_text_prompt` to True to decode the token
+        # IDs back into text while preserving Harmony markers.
+        request_kwargs = {
+            "model": self.model_path_or_id,
+            "temperature": self.temperature,
+            "max_tokens": leftover_tokens_count,
+            "timeout": 72000,  # Avoid timeout errors
+        }
+
+        if isinstance(formatted_prompt, list):
+            if self.server_requires_text_prompt:
+                request_kwargs["prompt"] = self.tokenizer.decode(
+                    formatted_prompt,
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+                inference_data["inference_input_log"]["formatted_prompt"] = request_kwargs["prompt"]
+            else:
+                request_kwargs["input"] = formatted_prompt
         else:
-            api_response = self.client.completions.create(
-                model=self.model_path_or_id,
-                temperature=self.temperature,
-                prompt=formatted_prompt,
-                max_tokens=leftover_tokens_count,
-                timeout=72000,  # Avoid timeout errors
-            )
+            request_kwargs["prompt"] = formatted_prompt
+
+        if len(extra_body) > 0:
+            request_kwargs["extra_body"] = extra_body
+
+        start_time = time.time()
+        api_response = self.client.completions.create(**request_kwargs)
         end_time = time.time()
 
         return api_response, end_time - start_time
