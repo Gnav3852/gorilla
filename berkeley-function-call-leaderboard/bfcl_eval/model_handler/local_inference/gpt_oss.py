@@ -434,7 +434,8 @@ class GPTOSSHandler(OSSHandler):
             conversation=conversation,
             next_turn_role=Role.ASSISTANT,
         )
-        inference_data["inference_input_log"] = {"prompt": conversation_tokens}
+        prompt = self.harmony_encoding.decode_utf8(conversation_tokens)
+        inference_data["inference_input_log"] = {"prompt": prompt}
 
         input_token_count = len(conversation_tokens)
         if self.max_context_length < input_token_count + 2:
@@ -446,7 +447,7 @@ class GPTOSSHandler(OSSHandler):
 
         payload = {
             "model": self.model_path_or_id,
-            "input": conversation_tokens,
+            "input": prompt,
             "temperature": self.temperature,
             "max_output_tokens": leftover_tokens_count,
         }
