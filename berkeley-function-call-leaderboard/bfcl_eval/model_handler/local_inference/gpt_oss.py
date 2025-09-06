@@ -20,9 +20,8 @@ try:
         Message,
         Conversation,
         Role,
-        Author,
         load_harmony_encoding,
-        HarmonyEncodingName
+        HarmonyEncodingName,
     )
     HARMONY_AVAILABLE = True
 except ImportError:
@@ -42,16 +41,16 @@ class GPTOSSHandler(OSSHandler):
         super().__init__(model_name, temperature)
         self.is_fc_model = True
         self.model_style = ModelStyle.OSSMODEL
-        self.harmony_available = HARMONY_AVAILABLE
-        
-        # Harmony encoding for GPT-OSS
-        self.harmony_encoding = None
-        if HARMONY_AVAILABLE:
-            try:
-                self.harmony_encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
-            except Exception as e:
-                print(f"Warning: Failed to load Harmony encoding: {e}")
-                self.harmony_encoding = None
+
+        if not HARMONY_AVAILABLE:
+            raise RuntimeError("openai-harmony is required for GPT-OSS models")
+
+        try:
+            self.harmony_encoding = load_harmony_encoding(
+                HarmonyEncodingName.HARMONY_GPT_OSS
+            )
+        except Exception as e:
+            raise RuntimeError(f"Failed to load Harmony encoding: {e}")
 
     @override
     def inference(
@@ -75,18 +74,11 @@ class GPTOSSHandler(OSSHandler):
 
     @override
     def _format_prompt(self, messages, function):
-        """
-        Format prompt using Harmony format for GPT-OSS models.
-        Falls back to standard format if Harmony is not available.
-        """
+        """Format prompt using Harmony format for GPT-OSS models."""
         if not HARMONY_AVAILABLE or not self.harmony_encoding:
-            return self._format_prompt_fallback(messages, function)
-        
-        try:
-            return self._format_prompt_harmony(messages, function)
-        except Exception as e:
-            print(f"Warning: Harmony formatting failed, falling back: {e}")
-            return self._format_prompt_fallback(messages, function)
+            raise RuntimeError("Harmony encoding not available for GPT-OSS")
+
+        return self._format_prompt_harmony(messages, function)
 
     def _format_prompt_harmony(self, messages, function):
         """Format prompt using Harmony format."""
@@ -141,43 +133,8 @@ class GPTOSSHandler(OSSHandler):
                 message = Message.from_role_and_content(role, content)
                 conversation.messages.append(message)
         
-        # Encode using Harmony
-        token_ids = self.harmony_encoding.render_conversation_for_completion(
-            conversation, Role.ASSISTANT
-        )
-
-        # Return the raw token ids so that `_query_prompting` can send them
-        # directly in the request body (under the `input` field) without
-        # decoding. This preserves Harmony markers and avoids a round-trip
-        # through text.
-        return token_ids
-
-    def _format_prompt_fallback(self, messages, function):
-        """Fallback formatting when Harmony is not available."""
-        formatted_prompt = ""
-        
-        # Add system message
-        if messages and messages[0]["role"] == "system":
-            formatted_prompt += f"System: {messages[0]['content']}\n\n"
-            messages = messages[1:]
-        
-        # Add function definitions
-        if function:
-            formatted_prompt += "Available functions:\n"
-            for func in function:
-                formatted_prompt += f"- {func['name']}: {func['description']}\n"
-                if 'parameters' in func:
-                    formatted_prompt += f"  Parameters: {json.dumps(func['parameters'], indent=2)}\n"
-            formatted_prompt += "\n"
-        
-        # Add conversation
-        for msg in messages:
-            role = msg["role"].title()
-            content = msg["content"]
-            formatted_prompt += f"{role}: {content}\n"
-        
-        formatted_prompt += "Assistant: "
-        return formatted_prompt
+        # Convert conversation to text
+        return conversation.to_json()
 
     def _convert_functions_to_harmony(self, functions):
         """Convert BFCL function specs to Harmony namespace mapping.
@@ -238,157 +195,115 @@ class GPTOSSHandler(OSSHandler):
     @override
     def _parse_query_response_prompting(self, api_response: Any) -> dict:
         """Parse response from GPT-OSS model."""
-        try:
-            # Try to parse as Harmony format first
-            if HARMONY_AVAILABLE and self.harmony_encoding:
-                return self._parse_harmony_response(api_response)
-            else:
-                return self._parse_fallback_response(api_response)
-        except Exception as e:
-            print(f"Warning: Response parsing failed, using fallback: {e}")
-            return self._parse_fallback_response(api_response)
+        if not self.harmony_encoding:
+            raise RuntimeError("Harmony encoding not available for GPT-OSS")
+        return self._parse_harmony_response(api_response)
 
     def _parse_harmony_response(self, api_response):
         """Parse response using Harmony format."""
-        if not self.harmony_encoding:
-            return self._parse_fallback_response(api_response)
+        token_ids = None
 
-        try:
-            token_ids = None
+        # Try different locations for token ids depending on the response schema
+        if hasattr(api_response, "output") and api_response.output:
+            first = api_response.output[0]
+            token_ids = getattr(first, "token_ids", None) or getattr(first, "tokens", None)
 
-            # Try different locations for token ids depending on the response schema
-            if hasattr(api_response, "output") and api_response.output:
-                first = api_response.output[0]
-                token_ids = getattr(first, "token_ids", None) or getattr(first, "tokens", None)
+        if token_ids is None and hasattr(api_response, "choices") and api_response.choices:
+            choice = api_response.choices[0]
+            token_ids = getattr(choice, "token_ids", None)
+            if token_ids is None and getattr(choice, "logprobs", None) is not None:
+                token_ids = getattr(choice.logprobs, "token_ids", None) or getattr(choice.logprobs, "tokens", None)
 
-            if token_ids is None and hasattr(api_response, "choices") and api_response.choices:
-                choice = api_response.choices[0]
-                token_ids = getattr(choice, "token_ids", None)
-                if token_ids is None and getattr(choice, "logprobs", None) is not None:
-                    token_ids = getattr(choice.logprobs, "token_ids", None) or getattr(choice.logprobs, "tokens", None)
+        if not token_ids:
+            raise RuntimeError("No Harmony tokens found in API response")
 
-            if not token_ids:
-                return self._parse_fallback_response(api_response)
+        parsed_messages = self.harmony_encoding.parse_messages_from_completion_tokens(
+            token_ids, Role.ASSISTANT
+        )
 
-            parsed_messages = self.harmony_encoding.parse_messages_from_completion_tokens(
-                token_ids, Role.ASSISTANT
-            )
+        assistant_messages: List[Dict[str, Any]] = []
+        tool_call_ids: List[str] = []
+        tool_names: List[str] = []
+        tool_calls: List[Dict[str, Any]] = []
+        final_messages: List[str] = []
+        reasoning_messages: List[str] = []
 
-            assistant_messages: List[Dict[str, Any]] = []
-            tool_call_ids: List[str] = []
-            tool_names: List[str] = []
-            tool_calls: List[Dict[str, Any]] = []
-            final_messages: List[str] = []
-            reasoning_messages: List[str] = []
+        for msg in parsed_messages:
+            if msg.role != Role.ASSISTANT:
+                continue
 
-            for msg in parsed_messages:
-                if msg.role != Role.ASSISTANT:
-                    continue
+            recipient = getattr(msg, "recipient", None)
+            channel = getattr(msg, "channel", None)
 
-                recipient = getattr(msg, "recipient", None)
-                channel = getattr(msg, "channel", None)
+            if recipient:
+                try:
+                    args = json.loads(msg.content)
+                except Exception:
+                    args = msg.content
 
-                if recipient:
-                    try:
-                        args = json.loads(msg.content)
-                    except Exception:
-                        args = msg.content
+                tool_calls.append({recipient: args})
+                tool_names.append(recipient)
+                tool_call_ids.append(recipient)
 
-                    tool_calls.append({recipient: args})
-                    tool_names.append(recipient)
-                    tool_call_ids.append(recipient)
-
-                    assistant_messages.append(
-                        {
-                            "role": "assistant",
-                            "tool_calls": [
-                                {
-                                    "id": recipient,
-                                    "type": "function",
-                                    "function": {
-                                        "name": recipient,
-                                        "arguments": json.dumps(args)
-                                        if isinstance(args, (dict, list))
-                                        else str(args),
-                                    },
-                                }
-                            ],
-                            "content": "",
-                        }
-                    )
-                else:
-                    if channel == "analysis":
-                        reasoning_messages.append(msg.content)
-                    else:
-                        final_messages.append(msg.content)
-
-                    assistant_messages.append(
-                        {"role": "assistant", "content": msg.content}
-                    )
-
-            model_responses: Any
-            if tool_calls:
-                model_responses = tool_calls
+                assistant_messages.append(
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": recipient,
+                                "type": "function",
+                                "function": {
+                                    "name": recipient,
+                                    "arguments": json.dumps(args)
+                                    if isinstance(args, (dict, list))
+                                    else str(args),
+                                },
+                            }
+                        ],
+                        "content": "",
+                    }
+                )
             else:
-                # Use the last non-analysis message as final response
-                model_responses = final_messages[-1] if final_messages else ""
+                if channel == "analysis":
+                    reasoning_messages.append(msg.content)
+                else:
+                    final_messages.append(msg.content)
 
-            return {
-                "model_responses": model_responses,
-                "model_responses_message_for_chat_history": assistant_messages,
-                "model_responses_decoded": tool_names,
-                "tool_call_ids": tool_call_ids,
-                "reasoning_content": "\n".join(reasoning_messages),
-                "input_token": getattr(api_response.usage, "prompt_tokens", 0)
-                if hasattr(api_response, "usage")
-                else 0,
-                "output_token": getattr(api_response.usage, "completion_tokens", 0)
-                if hasattr(api_response, "usage")
-                else 0,
-            }
+                assistant_messages.append(
+                    {"role": "assistant", "content": msg.content}
+                )
 
-        except Exception as e:
-            print(f"Warning: Harmony response parsing failed: {e}")
-            return self._parse_fallback_response(api_response)
-
-    def _parse_fallback_response(self, api_response):
-        """Fallback response parsing."""
-        if hasattr(api_response, 'choices') and api_response.choices:
-            model_response = api_response.choices[0].text
+        model_responses: Any
+        if tool_calls:
+            model_responses = tool_calls
         else:
-            model_response = str(api_response)
-        
+            model_responses = final_messages[-1] if final_messages else ""
+
         return {
-            "model_responses": model_response,
-            "input_token": getattr(api_response.usage, 'prompt_tokens', 0) if hasattr(api_response, 'usage') else 0,
-            "output_token": getattr(api_response.usage, 'completion_tokens', 0) if hasattr(api_response, 'usage') else 0,
+            "model_responses": model_responses,
+            "model_responses_message_for_chat_history": assistant_messages,
+            "model_responses_decoded": tool_names,
+            "tool_call_ids": tool_call_ids,
+            "reasoning_content": "\n".join(reasoning_messages),
+            "input_token": getattr(api_response.usage, "prompt_tokens", 0)
+            if hasattr(api_response, "usage")
+            else 0,
+            "output_token": getattr(api_response.usage, "completion_tokens", 0)
+            if hasattr(api_response, "usage")
+            else 0,
         }
 
-    @override
-    def _add_assistant_message_prompting(self, inference_data: dict, model_response_data: dict) -> dict:
-        """Add assistant message to conversation."""
-        messages = model_response_data.get(
-            "model_responses_message_for_chat_history"
-        )
-        if messages:
-            inference_data["message"].extend(messages)
-        else:
-            inference_data["message"].append(
-                {
-                    "role": "assistant",
-                    "content": model_response_data["model_responses"],
-                }
-            )
-        return inference_data
-
-    def _add_assistant_message_FC(
+    def _add_assistant_message(
         self, inference_data: dict, model_response_data: dict
     ) -> dict:
         messages = model_response_data.get(
             "model_responses_message_for_chat_history"
         )
         if messages:
-            inference_data["message"].extend(messages)
+            if isinstance(messages, list):
+                inference_data["message"].extend(messages)
+            else:
+                inference_data["message"].append(messages)
         else:
             inference_data["message"].append(
                 {
@@ -397,6 +312,9 @@ class GPTOSSHandler(OSSHandler):
                 }
             )
         return inference_data
+
+    _add_assistant_message_prompting = _add_assistant_message
+    _add_assistant_message_FC = _add_assistant_message
 
     def _get_model_path(self):
         """Get the model path for GPT-OSS models."""
@@ -423,10 +341,7 @@ class GPTOSSHandler(OSSHandler):
     @override
     def _compile_tools(self, inference_data: dict, test_entry: dict) -> dict:
         functions: list = test_entry.get("function", [])
-        if self.harmony_available and self.harmony_encoding:
-            inference_data["tools"] = self._convert_functions_to_harmony(functions)
-        else:
-            inference_data["tools"] = {}
+        inference_data["tools"] = self._convert_functions_to_harmony(functions)
         return inference_data
 
     def _build_conversation(self, messages: List[Dict], tools: Dict) -> Conversation:
@@ -435,73 +350,33 @@ class GPTOSSHandler(OSSHandler):
         )
         for ns in tools.values():
             system_content = system_content.with_tools(ns)
-        conversation = Conversation()
-        system_message = Message.from_role_and_content(Role.SYSTEM, system_content)
-        conversation.messages.append(system_message)
 
-        for msg in messages:
-            role = msg.get("role")
-            if role == "user":
-                user_msg = Message.from_role_and_content(
-                    Role.USER, msg.get("content", "")
-                )
-                conversation.messages.append(user_msg)
-            elif role == "assistant":
-                content = msg.get("content", "")
-                assistant_msg = Message.from_role_and_content(Role.ASSISTANT, content)
-                assistant_msg = assistant_msg.with_channel("final")
-                conversation.messages.append(assistant_msg)
-                for tool_call in msg.get("tool_calls", []):
-                    fn = tool_call.get("function", {})
-                    tool_msg = Message.from_role_and_content(
-                        Role.ASSISTANT, fn.get("arguments", "")
-                    )
-                    tool_msg = tool_msg.with_recipient(
-                        f"functions.{fn.get('name', '')}"
-                    )
-                    tool_msg = tool_msg.with_channel("commentary")
-                    conversation.messages.append(tool_msg)
-            elif role == "tool":
-                tool_message = Message.from_author_and_content(
-                    Author.new(Role.TOOL, f"functions.{msg.get('name', '')}"),
-                    msg.get("content", ""),
-                )
-                tool_message = tool_message.with_recipient("assistant")
-                tool_message = tool_message.with_channel("commentary")
-                conversation.messages.append(tool_message)
-        return conversation
+        harmony_messages = [
+            Message.from_role_and_content(Role.SYSTEM, system_content)
+        ]
+        harmony_messages.extend(Message.from_dict(m) for m in messages)
+        return Conversation.from_messages(harmony_messages)
 
     @override
     def _query_FC(self, inference_data: dict):
-        if not self.harmony_available or not self.harmony_encoding:
+        if not self.harmony_encoding:
             raise RuntimeError("Harmony encoding not available for GPT-OSS FC")
 
         message: list[dict] = inference_data["message"]
         tools: Dict = inference_data.get("tools", {})
         conversation = self._build_conversation(message, tools)
 
-        token_ids = self.harmony_encoding.render_conversation_for_completion(
-            conversation, Role.ASSISTANT
-        )
-        inference_data["inference_input_log"] = {"token_ids": token_ids}
-
-        input_token_count = len(token_ids)
-        if self.max_context_length < input_token_count + 2:
-            leftover_tokens_count = 1000
-        else:
-            leftover_tokens_count = min(
-                4096, self.max_context_length - input_token_count - 2
-            )
+        input_text = conversation.to_json()
+        inference_data["inference_input_log"] = {"text": input_text}
 
         decoder_config = {
             "temperature": self.temperature,
-            "max_new_tokens": leftover_tokens_count,
-            "stop_token_ids": self.harmony_encoding.stop_tokens_for_assistant_actions(),
+            "max_new_tokens": 4096,
         }
 
         payload = {
             "model": self.model_path_or_id,
-            "input": token_ids,
+            "input": input_text,
             "decoder_config": decoder_config,
         }
 
@@ -595,15 +470,6 @@ class GPTOSSHandler(OSSHandler):
         self, inference_data: dict, user_message: list[dict]
     ) -> dict:
         inference_data["message"].extend(user_message)
-        return inference_data
-
-    @override
-    def _add_assistant_message_FC(
-        self, inference_data: dict, model_response_data: dict
-    ) -> dict:
-        inference_data["message"].append(
-            model_response_data["model_responses_message_for_chat_history"]
-        )
         return inference_data
 
     @override
