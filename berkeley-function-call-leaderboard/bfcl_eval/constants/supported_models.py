@@ -174,4 +174,6 @@ SUPPORTED_MODELS = [
     "qwen/qwq-32b-novita",
     "qwen3-4b-think-FC",
     "qwen3-4b-nothink-FC",
+    "gpt-oss-20b",
+    "gpt-oss-120b",
 ]

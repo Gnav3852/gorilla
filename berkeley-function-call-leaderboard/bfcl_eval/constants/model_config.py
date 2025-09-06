@@ -63,6 +63,7 @@ from bfcl_eval.model_handler.local_inference.salesforce_qwen import (
     SalesforceQwenHandler,
 )
 from bfcl_eval.model_handler.local_inference.think_agent import ThinkAgentHandler
+from bfcl_eval.model_handler.local_inference.gpt_oss import GPTOSSHandler
 
 # -----------------------------------------------------------------------------
 # A mapping of model identifiers to their respective model configurations.
@@ -1950,6 +1951,30 @@ local_inference_model_map = {
         input_price=None,
         output_price=None,
         is_fc_model=False,
+        underscore_to_dot=False,
+    ),
+    "gpt-oss-20b": ModelConfig(
+        model_name="gpt-oss-20b",
+        display_name="GPT-OSS-20B (FC)",
+        url="https://github.com/openai/gpt-oss",
+        org="OpenAI",
+        license="Apache-2.0",
+        model_handler=GPTOSSHandler,
+        input_price=None,
+        output_price=None,
+        is_fc_model=True,
+        underscore_to_dot=False,
+    ),
+    "gpt-oss-120b": ModelConfig(
+        model_name="gpt-oss-120b",
+        display_name="GPT-OSS-120B (FC)",
+        url="https://github.com/openai/gpt-oss",
+        org="OpenAI",
+        license="Apache-2.0",
+        model_handler=GPTOSSHandler,
+        input_price=None,
+        output_price=None,
+        is_fc_model=True,
         underscore_to_dot=False,
     ),
 }
