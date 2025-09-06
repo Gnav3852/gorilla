@@ -368,6 +368,7 @@ class GPTOSSHandler(OSSHandler):
         tools: Dict = inference_data.get("tools", {})
         conversation = self._build_conversation(message, tools)
 
+        # Send Harmony conversation as JSON text to the inference endpoint
         input_text = conversation.to_json()
         inference_data["inference_input_log"] = {"text": input_text}
 
