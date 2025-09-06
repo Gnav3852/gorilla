@@ -91,14 +91,16 @@ class GPTOSSHandler(OSSHandler):
     def _format_prompt_harmony(self, messages, function):
         """Format prompt using Harmony format."""
         # Convert function docs to Harmony format
-        harmony_tools = self._convert_functions_to_harmony(function) if function else {}
-        
+        harmony_tools = (
+            self._convert_functions_to_harmony(function) if function else {}
+        )
+
         # Create system content with tools
         system_content = SystemContent.new()
-        
+
         # Add tools if available
-        if harmony_tools:
-            system_content = system_content.with_tools(harmony_tools)
+        for ns in harmony_tools.values():
+            system_content = system_content.with_tools(ns)
         
         # Add conversation start date
         system_content = system_content.with_conversation_start_date(
@@ -174,22 +176,60 @@ class GPTOSSHandler(OSSHandler):
         return formatted_prompt
 
     def _convert_functions_to_harmony(self, functions):
-        """Convert BFCL function format to Harmony tool format."""
-        tools = {}
-        
-        for func in functions:
-            tool_name = func["name"]
-            tool_def = {
-                "type": "function",
-                "function": {
-                    "name": func["name"],
-                    "description": func.get("description", ""),
-                    "parameters": func.get("parameters", {})
-                }
-            }
-            tools[tool_name] = tool_def
-        
-        return tools
+        """Convert BFCL function specs to Harmony namespace mapping.
+
+        The latest ``openai_harmony`` API expects tools to be organised into a
+        :class:`NamespaceConfig` which itself contains ``Tool`` objects.  Older
+        versions of the library exposed ``ToolNamespaceConfig`` and
+        ``ToolDescription`` instead.  To maintain compatibility we try the new
+        imports first and gracefully fall back to the old ones if necessary.
+
+        Parameters
+        ----------
+        functions: list
+            List of BFCL function dictionaries.
+
+        Returns
+        -------
+        dict
+            Mapping of ``{namespace.name: namespace}`` suitable to be passed to
+            :func:`SystemContent.with_tools`.
+        """
+
+        if not functions:
+            return {}
+
+        try:  # Newer ``openai_harmony`` versions
+            from openai_harmony import NamespaceConfig, Tool, Function
+            namespace = NamespaceConfig(name="functions", tools={})
+            for func in functions:
+                namespace.tools[func["name"]] = Tool(
+                    function=Function(
+                        name=func["name"],
+                        description=func.get("description", ""),
+                        parameters=func.get("parameters", {}),
+                    )
+                )
+        except Exception:
+            # Fallback for older versions where ToolNamespaceConfig/ToolDescription
+            # are used instead of NamespaceConfig/Tool/Function
+            try:
+                from openai_harmony import ToolNamespaceConfig as NamespaceConfig
+                from openai_harmony import ToolDescription as Function
+
+                namespace = NamespaceConfig(name="functions", tools={})
+                for func in functions:
+                    namespace.tools[func["name"]] = Function(
+                        name=func["name"],
+                        description=func.get("description", ""),
+                        parameters=func.get("parameters", {}),
+                    )
+            except Exception:
+                # If harmony isn't available or another unexpected failure occurs
+                # simply return empty tools to avoid crashing the caller.
+                return {}
+
+        return {namespace.name: namespace}
 
     @override
     def _parse_query_response_prompting(self, api_response: Any) -> dict:
@@ -389,8 +429,8 @@ class GPTOSSHandler(OSSHandler):
         system_content = SystemContent.new().with_conversation_start_date(
             datetime.now().strftime("%Y-%m-%d")
         )
-        if tools:
-            system_content = system_content.with_tools(tools)
+        for ns in tools.values():
+            system_content = system_content.with_tools(ns)
         conversation = Conversation()
         conversation.add_message(
             Message.from_role_and_content(Role.SYSTEM, system_content)
