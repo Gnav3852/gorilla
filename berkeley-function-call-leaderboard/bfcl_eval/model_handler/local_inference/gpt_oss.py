@@ -2,7 +2,7 @@ import json
 import os
 import time
 from datetime import datetime
-from typing import Any, List, Dict
+from typing import Any, List, Dict, Optional
 
 import requests
 from bfcl_eval.model_handler.base_handler import BaseHandler
@@ -205,118 +205,163 @@ class GPTOSSHandler(OSSHandler):
             raise RuntimeError("Harmony encoding required for GPT-OSS models")
         return self._parse_harmony_response(api_response)
 
-    def _parse_harmony_response(self, api_response):
-        """Parse response using Harmony format."""
+    def _parse_harmony_response(self, api_response: Any) -> dict:
+        """Parse response using Harmony format, returning tool calls and text."""
         if not self.harmony_encoding:
             raise RuntimeError("Harmony encoding required for GPT-OSS models")
 
         try:
-            token_ids = None
+            data = api_response if isinstance(api_response, dict) else api_response
 
-            # Try different locations for token ids depending on the response schema
-            if hasattr(api_response, "output") and api_response.output:
-                first = api_response.output[0]
+            # ----- Token extraction -----
+            token_ids: Optional[List[int]] = None
+            if hasattr(data, "output") and getattr(data, "output"):
+                first = data.output[0]
                 token_ids = getattr(first, "token_ids", None) or getattr(
                     first, "tokens", None
                 )
 
             if (
                 token_ids is None
-                and hasattr(api_response, "choices")
-                and api_response.choices
+                and hasattr(data, "choices")
+                and getattr(data, "choices")
             ):
-                choice = api_response.choices[0]
+                choice = data.choices[0]
                 token_ids = getattr(choice, "token_ids", None)
                 if token_ids is None and getattr(choice, "logprobs", None) is not None:
                     token_ids = getattr(choice.logprobs, "token_ids", None) or getattr(
                         choice.logprobs, "tokens", None
                     )
 
-            if not token_ids:
-                raise RuntimeError("No tokens found in Harmony response")
-
-            parsed_messages = (
-                self.harmony_encoding.parse_messages_from_completion_tokens(
-                    token_ids, Role.ASSISTANT
-                )
-            )
+            output_section = None
+            if token_ids is None:
+                if isinstance(data, dict):
+                    output_section = data.get("output", [])
+                    if output_section and isinstance(output_section[0], int):
+                        token_ids = output_section
+                else:
+                    output_section = getattr(data, "output", [])
 
             assistant_messages: List[Dict[str, Any]] = []
             tool_call_ids: List[str] = []
             tool_names: List[str] = []
-            tool_calls: List[Dict[str, Any]] = []
+            tool_calls_exec: List[Dict[str, Any]] = []
             final_messages: List[str] = []
             reasoning_messages: List[str] = []
 
-            for msg in parsed_messages:
-                if msg.role != Role.ASSISTANT:
-                    continue
+            # ----- Parse token based responses -----
+            if token_ids:
+                parsed_messages = self.harmony_encoding.parse_messages_from_completion_tokens(
+                    token_ids, Role.ASSISTANT
+                )
 
-                recipient = getattr(msg, "recipient", None)
-                channel = getattr(msg, "channel", None)
+                for msg in parsed_messages:
+                    if msg.role != Role.ASSISTANT:
+                        continue
 
-                if recipient:
-                    try:
-                        args = json.loads(msg.content)
-                    except Exception:
-                        args = msg.content
+                    recipient = getattr(msg, "recipient", None)
+                    channel = getattr(msg, "channel", None)
 
-                    tool_calls.append({recipient: args})
-                    tool_names.append(recipient)
-                    tool_call_ids.append(recipient)
+                    if recipient:
+                        try:
+                            args = json.loads(msg.content)
+                        except Exception:
+                            args = msg.content
 
-                    assistant_messages.append(
-                        {
-                            "role": "assistant",
-                            "tool_calls": [
-                                {
-                                    "id": recipient,
-                                    "type": "function",
-                                    "function": {
-                                        "name": recipient,
-                                        "arguments": (
-                                            json.dumps(args)
-                                            if isinstance(args, (dict, list))
-                                            else str(args)
-                                        ),
-                                    },
-                                }
-                            ],
-                            "content": "",
-                        }
-                    )
-                else:
-                    if channel == "analysis":
-                        reasoning_messages.append(msg.content)
+                        name = recipient.split("functions.")[-1]
+                        call_id = name
+                        tool_calls_exec.append({name: args})
+                        tool_names.append(name)
+                        tool_call_ids.append(call_id)
+
+                        assistant_messages.append(
+                            {
+                                "role": "assistant",
+                                "tool_calls": [
+                                    {
+                                        "id": call_id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": name,
+                                            "arguments": (
+                                                json.dumps(args)
+                                                if isinstance(args, (dict, list))
+                                                else str(args)
+                                            ),
+                                        },
+                                    }
+                                ],
+                                "content": "",
+                            }
+                        )
                     else:
-                        final_messages.append(msg.content)
+                        if channel == "analysis":
+                            reasoning_messages.append(msg.content)
+                        else:
+                            final_messages.append(msg.content)
 
-                    assistant_messages.append(
-                        {"role": "assistant", "content": msg.content}
-                    )
-
-            model_responses: Any
-            if tool_calls:
-                model_responses = tool_calls
+                        assistant_messages.append(
+                            {"role": "assistant", "content": msg.content}
+                        )
+            # ----- Parse structured JSON responses -----
             else:
-                # Use the last non-analysis message as final response
-                model_responses = final_messages[-1] if final_messages else ""
+                output_list = output_section or []
+                assistant_message = {"role": "assistant", "content": ""}
+                reasoning_content = ""
+                for item in output_list:
+                    if item.get("type") == "function_call":
+                        name = item.get("name", "")
+                        arguments = item.get("arguments", "")
+                        call_id = item.get("call_id", name)
+                        tool_calls_exec.append({name: arguments})
+                        tool_names.append(name)
+                        tool_call_ids.append(call_id)
+                        assistant_message.setdefault("tool_calls", []).append(
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {"name": name, "arguments": arguments},
+                            }
+                        )
+                    elif item.get("type") == "message" and item.get("role") == "assistant":
+                        content = item.get("content", "")
+                        if isinstance(content, list):
+                            text = "".join(ci.get("text", "") for ci in content)
+                        else:
+                            text = content
+                        assistant_message["content"] += text
+                        final_messages.append(text)
+                    elif item.get("type") == "reasoning":
+                        reasoning_content = "".join(
+                            ci.get("text", "") for ci in item.get("content", [])
+                        )
+                if reasoning_content:
+                    reasoning_messages.append(reasoning_content)
+                assistant_messages.append(assistant_message)
+
+            final_text = final_messages[-1] if final_messages else ""
+            tool_calls_chat = [
+                {"id": tc_id, "name": name}
+                for tc_id, name in zip(tool_call_ids, tool_names)
+            ]
 
             return {
-                "model_responses": model_responses,
+                "model_responses": tool_calls_exec if tool_calls_exec else final_text,
+                "final_response": final_text,
                 "model_responses_message_for_chat_history": assistant_messages,
                 "model_responses_decoded": tool_names,
+                "tool_calls": tool_calls_chat,
                 "tool_call_ids": tool_call_ids,
                 "reasoning_content": "\n".join(reasoning_messages),
                 "input_token": (
-                    getattr(api_response.usage, "prompt_tokens", 0)
-                    if hasattr(api_response, "usage")
-                    else 0
+                    data.get("usage", {}).get("input_tokens", 0)
+                    if isinstance(data, dict)
+                    else getattr(getattr(data, "usage", None), "prompt_tokens", 0)
                 ),
                 "output_token": (
-                    getattr(api_response.usage, "completion_tokens", 0)
-                    if hasattr(api_response, "usage")
-                    else 0
+                    data.get("usage", {}).get("output_tokens", 0)
+                    if isinstance(data, dict)
+                    else getattr(getattr(data, "usage", None), "completion_tokens", 0)
                 ),
             }
 
@@ -453,73 +498,7 @@ class GPTOSSHandler(OSSHandler):
 
     @override
     def _parse_query_response_FC(self, api_response: Any) -> dict:
-        data = api_response if isinstance(api_response, dict) else api_response
-        model_responses = []
-        assistant_message = {"role": "assistant", "content": ""}
-        tool_calls = []
-        reasoning_content = ""
-
-        output = data.get("output", [])
-        if output and isinstance(output[0], int):
-            entries = self.harmony_encoding.parse_messages_from_completion_tokens(
-                output, Role.ASSISTANT
-            )
-            for entry in entries:
-                entry_dict = entry.to_dict()
-                recipient = entry_dict.get("recipient", "")
-                if recipient.startswith("functions."):
-                    name = recipient.split("functions.")[-1]
-                    arguments = entry_dict.get("content", [{}])[0].get("text", "")
-                    model_responses.append({name: arguments})
-                    call_id = f"call_{len(tool_calls)}"
-                    tool_calls.append({"id": call_id, "name": name})
-                    assistant_message.setdefault("tool_calls", []).append(
-                        {
-                            "id": call_id,
-                            "function": {"name": name, "arguments": arguments},
-                        }
-                    )
-                else:
-                    text = "".join(
-                        c.get("text", "") for c in entry_dict.get("content", [])
-                    )
-                    assistant_message["content"] += text
-                    model_responses.append(text)
-        else:
-            for item in output:
-                if item.get("type") == "function_call":
-                    name = item.get("name", "")
-                    arguments = item.get("arguments", "")
-                    model_responses.append({name: arguments})
-                    tool_calls.append({"id": item.get("call_id", ""), "name": name})
-                    assistant_message.setdefault("tool_calls", []).append(
-                        {
-                            "id": item.get("call_id", ""),
-                            "function": {"name": name, "arguments": arguments},
-                        }
-                    )
-                elif item.get("type") == "message" and item.get("role") == "assistant":
-                    content = item.get("content", "")
-                    if isinstance(content, list):
-                        text = "".join(ci.get("text", "") for ci in content)
-                    else:
-                        text = content
-                    assistant_message["content"] += text
-                    model_responses.append(text)
-                elif item.get("type") == "reasoning":
-                    reasoning_content = "".join(
-                        ci.get("text", "") for ci in item.get("content", [])
-                    )
-        assistant_message["reasoning_content"] = reasoning_content
-
-        return {
-            "model_responses": model_responses,
-            "model_responses_message_for_chat_history": assistant_message,
-            "tool_calls": tool_calls,
-            "reasoning_content": reasoning_content,
-            "input_token": data.get("usage", {}).get("input_tokens", 0),
-            "output_token": data.get("usage", {}).get("output_tokens", 0),
-        }
+        return self._parse_harmony_response(api_response)
 
     @override
     def add_first_turn_message_FC(
@@ -533,15 +512,6 @@ class GPTOSSHandler(OSSHandler):
         self, inference_data: dict, user_message: list[dict]
     ) -> dict:
         inference_data["message"].extend(user_message)
-        return inference_data
-
-    @override
-    def _add_assistant_message_FC(
-        self, inference_data: dict, model_response_data: dict
-    ) -> dict:
-        inference_data["message"].append(
-            model_response_data["model_responses_message_for_chat_history"]
-        )
         return inference_data
 
     @override
