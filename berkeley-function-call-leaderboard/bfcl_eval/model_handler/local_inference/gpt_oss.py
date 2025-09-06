@@ -43,15 +43,16 @@ class GPTOSSHandler(OSSHandler):
         self.is_fc_model = True
         self.model_style = ModelStyle.OSSMODEL
         self.harmony_available = HARMONY_AVAILABLE
-        
+
         # Harmony encoding for GPT-OSS
-        self.harmony_encoding = None
-        if HARMONY_AVAILABLE:
-            try:
-                self.harmony_encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
-            except Exception as e:
-                print(f"Warning: Failed to load Harmony encoding: {e}")
-                self.harmony_encoding = None
+        if not HARMONY_AVAILABLE:
+            raise ImportError("openai-harmony is required for GPT-OSS models")
+        try:
+            self.harmony_encoding = load_harmony_encoding(
+                HarmonyEncodingName.HARMONY_GPT_OSS
+            )
+        except Exception as e:
+            raise RuntimeError(f"Failed to load Harmony encoding: {e}")
 
     @override
     def inference(
@@ -75,18 +76,10 @@ class GPTOSSHandler(OSSHandler):
 
     @override
     def _format_prompt(self, messages, function):
-        """
-        Format prompt using Harmony format for GPT-OSS models.
-        Falls back to standard format if Harmony is not available.
-        """
+        """Format prompt using Harmony format for GPT-OSS models."""
         if not HARMONY_AVAILABLE or not self.harmony_encoding:
-            return self._format_prompt_fallback(messages, function)
-        
-        try:
-            return self._format_prompt_harmony(messages, function)
-        except Exception as e:
-            print(f"Warning: Harmony formatting failed, falling back: {e}")
-            return self._format_prompt_fallback(messages, function)
+            raise RuntimeError("Harmony encoding required for GPT-OSS models")
+        return self._format_prompt_harmony(messages, function)
 
     def _format_prompt_harmony(self, messages, function):
         """Format prompt using Harmony format."""
@@ -141,43 +134,10 @@ class GPTOSSHandler(OSSHandler):
                 message = Message.from_role_and_content(role, content)
                 conversation.messages.append(message)
         
-        # Encode using Harmony
-        token_ids = self.harmony_encoding.render_conversation_for_completion(
+        # Encode using Harmony and return token ids directly
+        return self.harmony_encoding.render_conversation_for_completion(
             conversation, Role.ASSISTANT
         )
-
-        # Return the raw token ids so that `_query_prompting` can send them
-        # directly in the request body (under the `input` field) without
-        # decoding. This preserves Harmony markers and avoids a round-trip
-        # through text.
-        return token_ids
-
-    def _format_prompt_fallback(self, messages, function):
-        """Fallback formatting when Harmony is not available."""
-        formatted_prompt = ""
-        
-        # Add system message
-        if messages and messages[0]["role"] == "system":
-            formatted_prompt += f"System: {messages[0]['content']}\n\n"
-            messages = messages[1:]
-        
-        # Add function definitions
-        if function:
-            formatted_prompt += "Available functions:\n"
-            for func in function:
-                formatted_prompt += f"- {func['name']}: {func['description']}\n"
-                if 'parameters' in func:
-                    formatted_prompt += f"  Parameters: {json.dumps(func['parameters'], indent=2)}\n"
-            formatted_prompt += "\n"
-        
-        # Add conversation
-        for msg in messages:
-            role = msg["role"].title()
-            content = msg["content"]
-            formatted_prompt += f"{role}: {content}\n"
-        
-        formatted_prompt += "Assistant: "
-        return formatted_prompt
 
     def _convert_functions_to_harmony(self, functions):
         """Convert BFCL function specs to Harmony namespace mapping.
@@ -237,21 +197,15 @@ class GPTOSSHandler(OSSHandler):
 
     @override
     def _parse_query_response_prompting(self, api_response: Any) -> dict:
-        """Parse response from GPT-OSS model."""
-        try:
-            # Try to parse as Harmony format first
-            if HARMONY_AVAILABLE and self.harmony_encoding:
-                return self._parse_harmony_response(api_response)
-            else:
-                return self._parse_fallback_response(api_response)
-        except Exception as e:
-            print(f"Warning: Response parsing failed, using fallback: {e}")
-            return self._parse_fallback_response(api_response)
+        """Parse response from GPT-OSS model using Harmony."""
+        if not HARMONY_AVAILABLE or not self.harmony_encoding:
+            raise RuntimeError("Harmony encoding required for GPT-OSS models")
+        return self._parse_harmony_response(api_response)
 
     def _parse_harmony_response(self, api_response):
         """Parse response using Harmony format."""
         if not self.harmony_encoding:
-            return self._parse_fallback_response(api_response)
+            raise RuntimeError("Harmony encoding required for GPT-OSS models")
 
         try:
             token_ids = None
@@ -268,7 +222,7 @@ class GPTOSSHandler(OSSHandler):
                     token_ids = getattr(choice.logprobs, "token_ids", None) or getattr(choice.logprobs, "tokens", None)
 
             if not token_ids:
-                return self._parse_fallback_response(api_response)
+                raise RuntimeError("No tokens found in Harmony response")
 
             parsed_messages = self.harmony_encoding.parse_messages_from_completion_tokens(
                 token_ids, Role.ASSISTANT
@@ -348,25 +302,12 @@ class GPTOSSHandler(OSSHandler):
             }
 
         except Exception as e:
-            print(f"Warning: Harmony response parsing failed: {e}")
-            return self._parse_fallback_response(api_response)
+            raise RuntimeError(f"Harmony response parsing failed: {e}")
 
-    def _parse_fallback_response(self, api_response):
-        """Fallback response parsing."""
-        if hasattr(api_response, 'choices') and api_response.choices:
-            model_response = api_response.choices[0].text
-        else:
-            model_response = str(api_response)
-        
-        return {
-            "model_responses": model_response,
-            "input_token": getattr(api_response.usage, 'prompt_tokens', 0) if hasattr(api_response, 'usage') else 0,
-            "output_token": getattr(api_response.usage, 'completion_tokens', 0) if hasattr(api_response, 'usage') else 0,
-        }
-
-    @override
-    def _add_assistant_message_prompting(self, inference_data: dict, model_response_data: dict) -> dict:
-        """Add assistant message to conversation."""
+    def _add_assistant_message(
+        self, inference_data: dict, model_response_data: dict
+    ) -> dict:
+        """Common helper to append assistant messages to the chat history."""
         messages = model_response_data.get(
             "model_responses_message_for_chat_history"
         )
@@ -380,23 +321,17 @@ class GPTOSSHandler(OSSHandler):
                 }
             )
         return inference_data
+
+    @override
+    def _add_assistant_message_prompting(
+        self, inference_data: dict, model_response_data: dict
+    ) -> dict:
+        return self._add_assistant_message(inference_data, model_response_data)
 
     def _add_assistant_message_FC(
         self, inference_data: dict, model_response_data: dict
     ) -> dict:
-        messages = model_response_data.get(
-            "model_responses_message_for_chat_history"
-        )
-        if messages:
-            inference_data["message"].extend(messages)
-        else:
-            inference_data["message"].append(
-                {
-                    "role": "assistant",
-                    "content": model_response_data["model_responses"],
-                }
-            )
-        return inference_data
+        return self._add_assistant_message(inference_data, model_response_data)
 
     def _get_model_path(self):
         """Get the model path for GPT-OSS models."""
@@ -423,10 +358,9 @@ class GPTOSSHandler(OSSHandler):
     @override
     def _compile_tools(self, inference_data: dict, test_entry: dict) -> dict:
         functions: list = test_entry.get("function", [])
-        if self.harmony_available and self.harmony_encoding:
-            inference_data["tools"] = self._convert_functions_to_harmony(functions)
-        else:
-            inference_data["tools"] = {}
+        if not self.harmony_available or not self.harmony_encoding:
+            raise RuntimeError("Harmony encoding required for GPT-OSS models")
+        inference_data["tools"] = self._convert_functions_to_harmony(functions)
         return inference_data
 
     def _build_conversation(self, messages: List[Dict], tools: Dict) -> Conversation:
@@ -435,41 +369,38 @@ class GPTOSSHandler(OSSHandler):
         )
         for ns in tools.values():
             system_content = system_content.with_tools(ns)
-        conversation = Conversation()
-        system_message = Message.from_role_and_content(Role.SYSTEM, system_content)
-        conversation.messages.append(system_message)
+
+        harmony_messages: List[Message] = [
+            Message.from_role_and_content(Role.SYSTEM, system_content)
+        ]
 
         for msg in messages:
             role = msg.get("role")
             if role == "user":
-                user_msg = Message.from_role_and_content(
-                    Role.USER, msg.get("content", "")
+                harmony_messages.append(
+                    Message.from_role_and_content(Role.USER, msg.get("content", ""))
                 )
-                conversation.messages.append(user_msg)
             elif role == "assistant":
-                content = msg.get("content", "")
-                assistant_msg = Message.from_role_and_content(Role.ASSISTANT, content)
-                assistant_msg = assistant_msg.with_channel("final")
-                conversation.messages.append(assistant_msg)
+                assistant_msg = Message.from_role_and_content(
+                    Role.ASSISTANT, msg.get("content", "")
+                ).with_channel("final")
+                harmony_messages.append(assistant_msg)
                 for tool_call in msg.get("tool_calls", []):
                     fn = tool_call.get("function", {})
                     tool_msg = Message.from_role_and_content(
                         Role.ASSISTANT, fn.get("arguments", "")
+                    ).with_recipient(f"functions.{fn.get('name', '')}").with_channel(
+                        "commentary"
                     )
-                    tool_msg = tool_msg.with_recipient(
-                        f"functions.{fn.get('name', '')}"
-                    )
-                    tool_msg = tool_msg.with_channel("commentary")
-                    conversation.messages.append(tool_msg)
+                    harmony_messages.append(tool_msg)
             elif role == "tool":
-                tool_message = Message.from_author_and_content(
+                tool_msg = Message.from_author_and_content(
                     Author.new(Role.TOOL, f"functions.{msg.get('name', '')}"),
                     msg.get("content", ""),
-                )
-                tool_message = tool_message.with_recipient("assistant")
-                tool_message = tool_message.with_channel("commentary")
-                conversation.messages.append(tool_message)
-        return conversation
+                ).with_recipient("assistant").with_channel("commentary")
+                harmony_messages.append(tool_msg)
+
+        return Conversation.from_messages(harmony_messages)
 
     @override
     def _query_FC(self, inference_data: dict):
@@ -480,13 +411,12 @@ class GPTOSSHandler(OSSHandler):
         tools: Dict = inference_data.get("tools", {})
         conversation = self._build_conversation(message, tools)
 
-        token_ids = self.harmony_encoding.render_conversation_for_completion(
+        prompt = self.harmony_encoding.render_text_for_completion(
             conversation, Role.ASSISTANT
         )
-        prompt = self.harmony_encoding.decode_utf8(token_ids)
         inference_data["inference_input_log"] = {"prompt": prompt}
 
-        input_token_count = len(token_ids)
+        input_token_count = len(self.harmony_encoding.encode(prompt))
         if self.max_context_length < input_token_count + 2:
             leftover_tokens_count = 1000
         else:
