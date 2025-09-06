@@ -4,17 +4,24 @@ import time
 from datetime import datetime
 from typing import Any, List, Dict
 
+import requests
+from bfcl_eval.model_handler.base_handler import BaseHandler
 from bfcl_eval.model_handler.local_inference.base_oss_handler import OSSHandler
 from bfcl_eval.constants.enums import ModelStyle
+from bfcl_eval.model_handler.utils import (
+    convert_to_function_call,
+    default_decode_ast_prompting,
+)
 from overrides import override
 
 try:
     from openai_harmony import (
-        SystemContent, 
-        Message, 
-        Conversation, 
-        Role, 
-        load_harmony_encoding, 
+        SystemContent,
+        Message,
+        Conversation,
+        Role,
+        Author,
+        load_harmony_encoding,
         HarmonyEncodingName
     )
     HARMONY_AVAILABLE = True
@@ -45,6 +52,26 @@ class GPTOSSHandler(OSSHandler):
             except Exception as e:
                 print(f"Warning: Failed to load Harmony encoding: {e}")
                 self.harmony_encoding = None
+
+    @override
+    def inference(
+        self,
+        test_entry: dict,
+        include_input_log: bool,
+        exclude_state_log: bool,
+    ):
+        """Use the generic BaseHandler inference pipeline instead of OSSHandler's."""
+        return BaseHandler.inference(
+            self, test_entry, include_input_log, exclude_state_log
+        )
+
+    @override
+    def decode_ast(self, result, language, has_tool_call_tag):
+        return default_decode_ast_prompting(result, language, has_tool_call_tag)
+
+    @override
+    def decode_execute(self, result, has_tool_call_tag):
+        return convert_to_function_call(result)
 
     @override
     def _format_prompt(self, messages, function):
@@ -212,3 +239,214 @@ class GPTOSSHandler(OSSHandler):
         endpoint = os.getenv("VLLM_ENDPOINT", "localhost")
         port = os.getenv("VLLM_PORT", "8000")
         return f"http://{endpoint}:{port}"
+
+    #### FC methods ####
+
+    @override
+    def _pre_query_processing_FC(self, inference_data: dict, test_entry: dict) -> dict:
+        inference_data["message"] = []
+        return inference_data
+
+    @override
+    def _compile_tools(self, inference_data: dict, test_entry: dict) -> dict:
+        functions: list = test_entry.get("function", [])
+        if self.harmony_available and self.harmony_encoding:
+            inference_data["tools"] = self._convert_functions_to_harmony(functions)
+        else:
+            inference_data["tools"] = {}
+        return inference_data
+
+    def _build_conversation(self, messages: List[Dict], tools: Dict) -> Conversation:
+        system_content = SystemContent.new().with_conversation_start_date(
+            datetime.now().strftime("%Y-%m-%d")
+        )
+        if tools:
+            system_content = system_content.with_tools(tools)
+        conversation = Conversation()
+        conversation.add_message(
+            Message.from_role_and_content(Role.SYSTEM, system_content)
+        )
+
+        for msg in messages:
+            role = msg.get("role")
+            if role == "user":
+                conversation.add_message(
+                    Message.from_role_and_content(Role.USER, msg.get("content", ""))
+                )
+            elif role == "assistant":
+                content = msg.get("content", "")
+                conversation.add_message(
+                    Message.from_role_and_content(Role.ASSISTANT, content).with_channel("final")
+                )
+                for tool_call in msg.get("tool_calls", []):
+                    fn = tool_call.get("function", {})
+                    conversation.add_message(
+                        Message.from_role_and_content(
+                            Role.ASSISTANT, fn.get("arguments", "")
+                        )
+                        .with_recipient(f"functions.{fn.get('name', '')}")
+                        .with_channel("commentary")
+                    )
+            elif role == "tool":
+                conversation.add_message(
+                    Message.from_author_and_content(
+                        Author.new(Role.TOOL, f"functions.{msg.get('name', '')}"),
+                        msg.get("content", ""),
+                    ).with_recipient("assistant").with_channel("commentary")
+                )
+        return conversation
+
+    @override
+    def _query_FC(self, inference_data: dict):
+        if not self.harmony_available or not self.harmony_encoding:
+            raise RuntimeError("Harmony encoding not available for GPT-OSS FC")
+
+        message: list[dict] = inference_data["message"]
+        tools: Dict = inference_data.get("tools", {})
+        conversation = self._build_conversation(message, tools)
+
+        token_ids = self.harmony_encoding.render_conversation_for_completion(
+            conversation, Role.ASSISTANT
+        )
+        inference_data["inference_input_log"] = {"token_ids": token_ids}
+
+        input_token_count = len(token_ids)
+        if self.max_context_length < input_token_count + 2:
+            leftover_tokens_count = 1000
+        else:
+            leftover_tokens_count = min(
+                4096, self.max_context_length - input_token_count - 2
+            )
+
+        decoder_config = {
+            "temperature": self.temperature,
+            "max_new_tokens": leftover_tokens_count,
+            "stop_token_ids": self.harmony_encoding.stop_tokens_for_assistant_actions(),
+        }
+
+        payload = {
+            "model": self.model_path_or_id,
+            "input": token_ids,
+            "decoder_config": decoder_config,
+        }
+
+        start_time = time.time()
+        response = requests.post(
+            f"{self.base_url}/responses", json=payload, timeout=72000
+        )
+        end_time = time.time()
+        response.raise_for_status()
+        return response.json(), end_time - start_time
+
+    @override
+    def _parse_query_response_FC(self, api_response: Any) -> dict:
+        data = api_response if isinstance(api_response, dict) else api_response
+        model_responses = []
+        assistant_message = {"role": "assistant", "content": ""}
+        tool_calls = []
+        reasoning_content = ""
+
+        output = data.get("output", [])
+        if output and isinstance(output[0], int):
+            entries = self.harmony_encoding.parse_messages_from_completion_tokens(
+                output, Role.ASSISTANT
+            )
+            for entry in entries:
+                entry_dict = entry.to_dict()
+                recipient = entry_dict.get("recipient", "")
+                if recipient.startswith("functions."):
+                    name = recipient.split("functions.")[-1]
+                    arguments = entry_dict.get("content", [{}])[0].get("text", "")
+                    model_responses.append({name: arguments})
+                    call_id = f"call_{len(tool_calls)}"
+                    tool_calls.append({"id": call_id, "name": name})
+                    assistant_message.setdefault("tool_calls", []).append(
+                        {
+                            "id": call_id,
+                            "function": {"name": name, "arguments": arguments},
+                        }
+                    )
+                else:
+                    text = "".join(
+                        c.get("text", "") for c in entry_dict.get("content", [])
+                    )
+                    assistant_message["content"] += text
+                    model_responses.append(text)
+        else:
+            for item in output:
+                if item.get("type") == "function_call":
+                    name = item.get("name", "")
+                    arguments = item.get("arguments", "")
+                    model_responses.append({name: arguments})
+                    tool_calls.append({"id": item.get("call_id", ""), "name": name})
+                    assistant_message.setdefault("tool_calls", []).append(
+                        {
+                            "id": item.get("call_id", ""),
+                            "function": {"name": name, "arguments": arguments},
+                        }
+                    )
+                elif item.get("type") == "message" and item.get("role") == "assistant":
+                    content = item.get("content", "")
+                    if isinstance(content, list):
+                        text = "".join(ci.get("text", "") for ci in content)
+                    else:
+                        text = content
+                    assistant_message["content"] += text
+                    model_responses.append(text)
+                elif item.get("type") == "reasoning":
+                    reasoning_content = "".join(
+                        ci.get("text", "") for ci in item.get("content", [])
+                    )
+        assistant_message["reasoning_content"] = reasoning_content
+
+        return {
+            "model_responses": model_responses,
+            "model_responses_message_for_chat_history": assistant_message,
+            "tool_calls": tool_calls,
+            "reasoning_content": reasoning_content,
+            "input_token": data.get("usage", {}).get("input_tokens", 0),
+            "output_token": data.get("usage", {}).get("output_tokens", 0),
+        }
+
+    @override
+    def add_first_turn_message_FC(
+        self, inference_data: dict, first_turn_message: list[dict]
+    ) -> dict:
+        inference_data["message"].extend(first_turn_message)
+        return inference_data
+
+    @override
+    def _add_next_turn_user_message_FC(
+        self, inference_data: dict, user_message: list[dict]
+    ) -> dict:
+        inference_data["message"].extend(user_message)
+        return inference_data
+
+    @override
+    def _add_assistant_message_FC(
+        self, inference_data: dict, model_response_data: dict
+    ) -> dict:
+        inference_data["message"].append(
+            model_response_data["model_responses_message_for_chat_history"]
+        )
+        return inference_data
+
+    @override
+    def _add_execution_results_FC(
+        self,
+        inference_data: dict,
+        execution_results: list[str],
+        model_response_data: dict,
+    ) -> dict:
+        for execution_result, tool in zip(
+            execution_results, model_response_data.get("tool_calls", [])
+        ):
+            inference_data["message"].append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool.get("id", ""),
+                    "name": tool.get("name", ""),
+                    "content": execution_result,
+                }
+            )
+        return inference_data
