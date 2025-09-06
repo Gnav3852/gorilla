@@ -390,6 +390,7 @@ class GPTOSSHandler(OSSHandler):
     ) -> dict:
         return self._add_assistant_message(inference_data, model_response_data)
 
+    @override
     def _add_assistant_message_FC(
         self, inference_data: dict, model_response_data: dict
     ) -> dict:
