@@ -22,8 +22,9 @@ try:
         Role,
         Author,
         load_harmony_encoding,
-        HarmonyEncodingName
+        HarmonyEncodingName,
     )
+
     HARMONY_AVAILABLE = True
 except ImportError:
     HARMONY_AVAILABLE = False
@@ -33,11 +34,11 @@ except ImportError:
 class GPTOSSHandler(OSSHandler):
     """
     Handler for GPT-OSS models using Harmony format.
-    
+
     GPT-OSS models require special Harmony format encoding/decoding
     and use remote inference via vLLM or similar serving infrastructure.
     """
-    
+
     def __init__(self, model_name, temperature) -> None:
         super().__init__(model_name, temperature)
         self.is_fc_model = True
@@ -84,9 +85,7 @@ class GPTOSSHandler(OSSHandler):
     def _format_prompt_harmony(self, messages, function):
         """Format prompt using Harmony format."""
         # Convert function docs to Harmony format
-        harmony_tools = (
-            self._convert_functions_to_harmony(function) if function else {}
-        )
+        harmony_tools = self._convert_functions_to_harmony(function) if function else {}
 
         # Create system content with tools
         system_content = SystemContent.new()
@@ -94,12 +93,12 @@ class GPTOSSHandler(OSSHandler):
         # Add tools if available
         for ns in harmony_tools.values():
             system_content = system_content.with_tools(ns)
-        
+
         # Add conversation start date
         system_content = system_content.with_conversation_start_date(
             datetime.now().strftime("%Y-%m-%d")
         )
-        
+
         # Create conversation
         conversation = Conversation()
 
@@ -126,14 +125,13 @@ class GPTOSSHandler(OSSHandler):
                     tool_name = tool_call.get("function", {}).get("name", "")
                     tool_args = tool_call.get("function", {}).get("arguments", "{}")
                     tool_msg = Message.from_role_and_content(
-                        Role.TOOL,
-                        f"Tool: {tool_name}, Args: {tool_args}"
+                        Role.TOOL, f"Tool: {tool_name}, Args: {tool_args}"
                     )
                     conversation.messages.append(tool_msg)
             else:
                 message = Message.from_role_and_content(role, content)
                 conversation.messages.append(message)
-        
+
         # Encode using Harmony and return token ids directly
         return self.harmony_encoding.render_conversation_for_completion(
             conversation, Role.ASSISTANT
@@ -165,6 +163,7 @@ class GPTOSSHandler(OSSHandler):
 
         try:  # Newer ``openai_harmony`` versions
             from openai_harmony import NamespaceConfig, Tool, Function
+
             namespace = NamespaceConfig(name="functions", tools={})
             for func in functions:
                 namespace.tools[func["name"]] = Tool(
@@ -213,19 +212,29 @@ class GPTOSSHandler(OSSHandler):
             # Try different locations for token ids depending on the response schema
             if hasattr(api_response, "output") and api_response.output:
                 first = api_response.output[0]
-                token_ids = getattr(first, "token_ids", None) or getattr(first, "tokens", None)
+                token_ids = getattr(first, "token_ids", None) or getattr(
+                    first, "tokens", None
+                )
 
-            if token_ids is None and hasattr(api_response, "choices") and api_response.choices:
+            if (
+                token_ids is None
+                and hasattr(api_response, "choices")
+                and api_response.choices
+            ):
                 choice = api_response.choices[0]
                 token_ids = getattr(choice, "token_ids", None)
                 if token_ids is None and getattr(choice, "logprobs", None) is not None:
-                    token_ids = getattr(choice.logprobs, "token_ids", None) or getattr(choice.logprobs, "tokens", None)
+                    token_ids = getattr(choice.logprobs, "token_ids", None) or getattr(
+                        choice.logprobs, "tokens", None
+                    )
 
             if not token_ids:
                 raise RuntimeError("No tokens found in Harmony response")
 
-            parsed_messages = self.harmony_encoding.parse_messages_from_completion_tokens(
-                token_ids, Role.ASSISTANT
+            parsed_messages = (
+                self.harmony_encoding.parse_messages_from_completion_tokens(
+                    token_ids, Role.ASSISTANT
+                )
             )
 
             assistant_messages: List[Dict[str, Any]] = []
@@ -261,9 +270,11 @@ class GPTOSSHandler(OSSHandler):
                                     "type": "function",
                                     "function": {
                                         "name": recipient,
-                                        "arguments": json.dumps(args)
-                                        if isinstance(args, (dict, list))
-                                        else str(args),
+                                        "arguments": (
+                                            json.dumps(args)
+                                            if isinstance(args, (dict, list))
+                                            else str(args)
+                                        ),
                                     },
                                 }
                             ],
@@ -293,12 +304,16 @@ class GPTOSSHandler(OSSHandler):
                 "model_responses_decoded": tool_names,
                 "tool_call_ids": tool_call_ids,
                 "reasoning_content": "\n".join(reasoning_messages),
-                "input_token": getattr(api_response.usage, "prompt_tokens", 0)
-                if hasattr(api_response, "usage")
-                else 0,
-                "output_token": getattr(api_response.usage, "completion_tokens", 0)
-                if hasattr(api_response, "usage")
-                else 0,
+                "input_token": (
+                    getattr(api_response.usage, "prompt_tokens", 0)
+                    if hasattr(api_response, "usage")
+                    else 0
+                ),
+                "output_token": (
+                    getattr(api_response.usage, "completion_tokens", 0)
+                    if hasattr(api_response, "usage")
+                    else 0
+                ),
             }
 
         except Exception as e:
@@ -308,9 +323,7 @@ class GPTOSSHandler(OSSHandler):
         self, inference_data: dict, model_response_data: dict
     ) -> dict:
         """Common helper to append assistant messages to the chat history."""
-        messages = model_response_data.get(
-            "model_responses_message_for_chat_history"
-        )
+        messages = model_response_data.get("model_responses_message_for_chat_history")
         if messages:
             inference_data["message"].extend(messages)
         else:
@@ -387,17 +400,23 @@ class GPTOSSHandler(OSSHandler):
                 harmony_messages.append(assistant_msg)
                 for tool_call in msg.get("tool_calls", []):
                     fn = tool_call.get("function", {})
-                    tool_msg = Message.from_role_and_content(
-                        Role.ASSISTANT, fn.get("arguments", "")
-                    ).with_recipient(f"functions.{fn.get('name', '')}").with_channel(
-                        "commentary"
+                    tool_msg = (
+                        Message.from_role_and_content(
+                            Role.ASSISTANT, fn.get("arguments", "")
+                        )
+                        .with_recipient(f"functions.{fn.get('name', '')}")
+                        .with_channel("commentary")
                     )
                     harmony_messages.append(tool_msg)
             elif role == "tool":
-                tool_msg = Message.from_author_and_content(
-                    Author.new(Role.TOOL, f"functions.{msg.get('name', '')}"),
-                    msg.get("content", ""),
-                ).with_recipient("assistant").with_channel("commentary")
+                tool_msg = (
+                    Message.from_author_and_content(
+                        Author.new(Role.TOOL, f"functions.{msg.get('name', '')}"),
+                        msg.get("content", ""),
+                    )
+                    .with_recipient("assistant")
+                    .with_channel("commentary")
+                )
                 harmony_messages.append(tool_msg)
 
         return Conversation.from_messages(harmony_messages)
@@ -411,12 +430,12 @@ class GPTOSSHandler(OSSHandler):
         tools: Dict = inference_data.get("tools", {})
         conversation = self._build_conversation(message, tools)
 
-        prompt = self.harmony_encoding.render_text_for_completion(
-            conversation, Role.ASSISTANT
+        conversation_tokens = self.harmony_encoding.render_conversation_for_completion(
+            conversation
         )
-        inference_data["inference_input_log"] = {"prompt": prompt}
+        inference_data["inference_input_log"] = {"prompt": conversation_tokens}
 
-        input_token_count = len(self.harmony_encoding.encode(prompt))
+        input_token_count = len(conversation_tokens)
         if self.max_context_length < input_token_count + 2:
             leftover_tokens_count = 1000
         else:
@@ -426,7 +445,7 @@ class GPTOSSHandler(OSSHandler):
 
         payload = {
             "model": self.model_path_or_id,
-            "input": prompt,
+            "input": conversation_tokens,
             "temperature": self.temperature,
             "max_output_tokens": leftover_tokens_count,
         }
