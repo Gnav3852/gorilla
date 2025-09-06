@@ -40,10 +40,7 @@ class GPTOSSHandler(OSSHandler):
     """
 
     def __init__(self, model_name, temperature) -> None:
-        # GPT-OSS models on HuggingFace are namespaced under "openai/".
-        # If the user provides the shorthand id (e.g. "gpt-oss-20b"),
-        # automatically expand it to include the prefix so that subsequent
-        # requests use the fully-qualified model name.
+        
         if not model_name.startswith("openai/"):
             model_name = f"openai/{model_name}"
 
@@ -453,10 +450,7 @@ class GPTOSSHandler(OSSHandler):
             )
 
         payload = {
-            # Use the model identifier supplied via the CLI argument. This
-            # allows callers to specify either fully-qualified names such as
-            # "openai/gpt-oss-20b" or rely on the automatic prefix expansion
-            # performed during initialisation.
+           
             "model": self.model_name,
             "input": prompt,
             "temperature": self.temperature,
